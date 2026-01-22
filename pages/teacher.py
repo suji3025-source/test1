@@ -42,7 +42,7 @@ def check_password():
         if st.button("로그인", use_container_width=True):
             # secrets.toml에서 비밀번호 확인
             try:
-                correct_password = st.secrets["1111"]
+                correct_password = st.secrets["TEACHER_PASSWORD"]
                 
                 if password == correct_password:
                     st.session_state.password_correct = True
