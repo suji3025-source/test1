@@ -1,290 +1,245 @@
-# teacher.py
-# ==================================================
-# 교사용 대시보드 - 학생 서술형 평가 결과 조회 및 분석
-# ==================================================
+# Step 1-2 – 서술형 문제 3개 포맷 (Streamlit)
+# --------------------------------------------------
+# Step 1-1에서 1문항 구조를 확장해 총 3문항으로 구성했습니다.
+# 이후 단계에서는 answers 리스트와 제출 로직을 그대로 두고
+# GPT 채점·DB(Supabase) 저장 함수를 추가하면 됩니다.
+# --------------------------------------------------
 
 import streamlit as st
-import pandas as pd
-from datetime import datetime, timedelta
+
+# ----Supabase 코드 추가----------------------------
 from supabase import create_client, Client
 
-# ── Supabase 클라이언트 초기화 ──
 @st.cache_resource
 def get_supabase_client() -> Client:
     url = st.secrets["SUPABASE_URL"]
-    key = st.secrets["SUPABASE_SERVICE_ROLE_KEY"]
+    key = st.secrets["SUPABASE_SERVICE_ROLE_KEY"]  # 서버 전용(절대 노출 금지)
     return create_client(url, key)
+# ----Supabase 코드 추가----------------------------
 
-# ── 데이터 조회 함수 ──
-@st.cache_data(ttl=60)  # 60초 캐시 (새로고침 시 최신 데이터 반영)
-def load_submissions(start_date=None, end_date=None):
-    """Supabase에서 제출 데이터를 가져옵니다."""
+# ── 1. 수업 제목 ──
+st.title("예시 수업 제목")  # ← 교과별 제목으로 자유롭게 수정하세요.
+
+# ── 2~4. 입력 + 제출을 form 안에 묶기 ──
+with st.form("submit_form"):
+    # ── 2. 학번 입력 ──
+    student_id = st.text_input("학번", help="학생의 학번을 작성하세요. (예: 10130)")
+
+    # ── 3-1. 서술형 문제 1 표시 ──
+    QUESTION_1 = "기체 입자들의 운동과 온도의 관계를 서술하세요."
+    st.markdown("#### 서술형 문제 1")
+    st.write(QUESTION_1)
+    answer_1 = st.text_area("답안을 입력하세요", key="answer1", height=150)
+
+    # ── 3-2. 서술형 문제 2 표시 ──
+    QUESTION_2 = "보일 법칙에 대해 설명하세요."
+    st.markdown("#### 서술형 문제 2")
+    st.write(QUESTION_2)
+    answer_2 = st.text_area("답안을 입력하세요", key="answer2", height=150)
+
+    # ── 3-3. 서술형 문제 3 표시 ──
+    QUESTION_3 = "열에너지 이동 3가지 방식(전도·대류·복사)을 설명하세요."
+    st.markdown("#### 서술형 문제 3")
+    st.write(QUESTION_3)
+    answer_3 = st.text_area("답안을 입력하세요", key="answer3", height=150)
+
+    # 답안을 리스트로 모아 이후 채점/저장 로직에서 재사용하기
+    answers = [answer_1, answer_2, answer_3]
+
+    # ── 4. 전체 제출 버튼(form 전용) ──
+    submitted = st.form_submit_button("제출")
+
+# ── 제출 처리 로직(제출 버튼을 눌렀을 때만 실행) ──
+if submitted:
+    if not student_id.strip():
+        st.warning("학번을 입력하세요.")
+    elif any(ans.strip() == "" for ans in answers):
+        st.warning("모든 답안을 작성하세요.")
+    else:
+        st.success(f"제출 완료! 학번: {student_id}")
+        # ⚠️ Step 2에서 GPT 채점 및 DB(Supabase) 저장 로직을 여기에 추가할 예정입니다.
+
+        # ✅ [핵심 수정] 제출 성공 신호를 줘서 아래 GPT 버튼을 활성화시킵니다.
+        st.session_state.submitted_ok = True
+        st.session_state.gpt_feedbacks = None # 재제출 시 기존 피드백 초기화
+
+# ==================================================
+# Step 2 – GPT API 기반 서술형 채점 + 피드백 (최종 수정본)
+# --------------------------------------------------
+# [사용법]
+# 1. Step 1-2 코드의 '제출 성공(else)' 블록 안에 다음 두 줄이 있어야 합니다:
+#    st.session_state.submitted_ok = True
+#    st.session_state.gpt_feedbacks = None 
+# 2. 이 코드를 Step 1-2 코드 맨 아래에 그대로 붙여넣으세요.
+# ==================================================
+
+from datetime import datetime, timezone
+
+# ── 0. 세션 상태 초기화(새로고침/리런에도 결과 유지) ──
+if "submitted_ok" not in st.session_state:
+    st.session_state.submitted_ok = False
+if "gpt_feedbacks" not in st.session_state:
+    st.session_state.gpt_feedbacks = None
+if "gpt_payload" not in st.session_state:
+    st.session_state.gpt_payload = None
+
+# ----Supabase 코드 추가----------------------------
+def save_to_supabase(payload: dict):
     supabase = get_supabase_client()
-    
-    query = supabase.table("student_submissions").select("*")
-    
-    # 날짜 필터링
-    if start_date:
-        query = query.gte("created_at", start_date.isoformat())
-    if end_date:
-        # 해당 날짜의 23:59:59까지 포함
-        end_datetime = datetime.combine(end_date, datetime.max.time())
-        query = query.lte("created_at", end_datetime.isoformat())
-    
-    # 최신순 정렬
-    query = query.order("created_at", desc=True)
-    
-    response = query.execute()
-    return response.data
 
-# ── O/X 판정 추출 함수 ──
-def extract_result(feedback: str) -> str:
-    """피드백에서 O/X 판정만 추출"""
-    if not feedback:
-        return "?"
-    if feedback.startswith("O:"):
-        return "O"
-    elif feedback.startswith("X:"):
-        return "X"
-    return "?"
+    row = {
+        "student_id": payload["student_id"],
+        "answer_1": payload["answers"]["Q1"],
+        "answer_2": payload["answers"]["Q2"],
+        "answer_3": payload["answers"]["Q3"],
+        "feedback_1": payload["feedbacks"]["Q1"],
+        "feedback_2": payload["feedbacks"]["Q2"],
+        "feedback_3": payload["feedbacks"]["Q3"],
+        "guideline_1": payload["guidelines"]["Q1"],
+        "guideline_2": payload["guidelines"]["Q2"],
+        "guideline_3": payload["guidelines"]["Q3"],
+        "model": payload["model"],
+        # created_at은 DB default(now()) 사용
+    }
 
-# ── 메인 대시보드 ──
-st.set_page_config(page_title="교사 대시보드", page_icon="📊", layout="wide")
+    return supabase.table("student_submissions").insert(row).execute()
 
-st.title("📊 학생 서술형 평가 - 교사 대시보드")
-st.markdown("---")
+# ----Supabase 코드 추가----------------------------
 
-# ── 사이드바: 필터 옵션 ──
-with st.sidebar:
-    st.header("🔍 필터 옵션")
-    
-    # 날짜 범위 선택
-    date_filter = st.checkbox("날짜 필터 사용", value=False)
-    
-    if date_filter:
-        col1, col2 = st.columns(2)
-        with col1:
-            start_date = st.date_input(
-                "시작 날짜",
-                value=datetime.now().date() - timedelta(days=7)
-            )
-        with col2:
-            end_date = st.date_input(
-                "종료 날짜",
-                value=datetime.now().date()
-            )
-    else:
-        start_date = None
-        end_date = None
-    
-    # 새로고침 버튼
-    if st.button("🔄 데이터 새로고침", use_container_width=True):
-        st.cache_data.clear()
-        st.rerun()
+# ── 1. 문항별 채점 기준(교사가 자유롭게 수정) ──
+GRADING_GUIDELINES = {
+    1: "기체 입자의 운동은 온도와 비례 관계임을 언급하고, 입자 충돌·속도 증가 예를 기술한다.",
+    2: "일정한 온도에서, 기체의 압력과 부피가 서로 반비례한다.",
+    3: "전도는 입자 간 직접 충돌, 대류는 유체의 순환, 복사는 전자기파를 통한 열 이동 방식이다.",
+}
 
-# ── 데이터 로드 ──
-try:
-    data = load_submissions(start_date, end_date)
+# ── 2. 모델 출력 후처리(형식/길이 안정화: O:/X: + 한 줄 + 200자) ──
+def normalize_feedback(text: str) -> str:
+    """AI 응답이 형식을 벗어나더라도 강제로 'O: ...' 또는 'X: ...' 형태로 보정합니다."""
+    if not text:
+        return "X: 피드백 생성 실패"
+
+    first_line = text.strip().splitlines()[0].strip()
+
+    # 접두사 보정 (예: 'O. 정답' -> 'O: 정답')
+    if first_line.startswith("O") and not first_line.startswith("O:"):
+        first_line = "O: " + first_line[1:].lstrip(": ").strip()
+    if first_line.startswith("X") and not first_line.startswith("X:"):
+        first_line = "X: " + first_line[1:].lstrip(": ").strip()
     
-    if not data:
-        st.warning("제출된 데이터가 없습니다.")
+    # O나 X로 시작하지 않는 경우 안전하게 X 처리 (혹은 O로 처리할지 선택 가능)
+    if not (first_line.startswith("O:") or first_line.startswith("X:")):
+        first_line = "X: " + first_line
+
+    head, body = first_line.split(":", 1)
+    body = body.strip()
+
+    # 200자 제한 (너무 긴 피드백 방지)
+    if len(body) > 200:
+        body = body[:200] + "…"
+
+    return f"{head.strip()}: {body}"
+
+# ── 3. GPT 피드백 버튼(제출 성공 시에만 활성화) ──
+if st.button("GPT 피드백 확인", disabled=not st.session_state.submitted_ok):
+
+    # [방어] Step 1-2 변수 존재 확인
+    # globals() 체크는 코드가 합쳐져서 실행될 때 유효합니다.
+    if "student_id" not in globals() or "answers" not in globals():
+        st.error("오류: student_id 또는 answers 변수를 찾을 수 없습니다. Step 1-2 코드 아래에 붙여넣으셨나요?")
         st.stop()
-    
-    df = pd.DataFrame(data)
-    
-    # created_at을 datetime으로 변환
-    df["created_at"] = pd.to_datetime(df["created_at"])
-    df["제출일시"] = df["created_at"].dt.strftime("%Y-%m-%d %H:%M")
-    
-    # O/X 결과 추출
-    df["결과1"] = df["feedback_1"].apply(extract_result)
-    df["결과2"] = df["feedback_2"].apply(extract_result)
-    df["결과3"] = df["feedback_3"].apply(extract_result)
-    
-except Exception as e:
-    st.error(f"데이터 로드 오류: {e}")
-    st.stop()
 
-# ── 1. 전체 통계 개요 ──
-st.header("📈 전체 통계")
+    # [비용 방지] 빈 답안이 있으면 호출하지 않기
+    if any(ans.strip() == "" for ans in answers):
+        st.warning("내용이 비어있는 답안이 있습니다. 제출을 다시 확인해주세요.")
+        st.stop()
 
-col1, col2, col3, col4 = st.columns(4)
+    # [라이브러리 확인] 버튼 클릭 시점에 체크하여 연수 진행 시 당황 방지
+    try:
+        from openai import OpenAI, OpenAIError
+    except ImportError:
+        st.error("openai 라이브러리가 설치되지 않았습니다. 터미널에 `pip install openai`를 입력하세요.")
+        st.stop()
 
-with col1:
-    st.metric("총 제출 수", len(df))
+    # [API 키 확인]
+    try:
+        client = OpenAI(api_key=st.secrets["OPENAI_API_KEY"])
+    except Exception:
+        st.error("⚠️ .streamlit/secrets.toml 파일에 OPENAI_API_KEY가 설정되지 않았습니다.")
+        st.stop()
 
-with col2:
-    unique_students = df["student_id"].nunique()
-    st.metric("제출 학생 수", unique_students)
+    feedbacks = []
 
-with col3:
-    latest_submission = df["created_at"].max().strftime("%m/%d %H:%M")
-    st.metric("최근 제출", latest_submission)
+    with st.spinner("AI 선생님이 꼼꼼하게 채점 중입니다... ⏳"):
+        for idx, ans in enumerate(answers, start=1):
+            criterion = GRADING_GUIDELINES.get(idx, "채점 기준 없음")
 
-with col4:
-    # 평균 정답 개수
-    total_correct = (
-        (df["결과1"] == "O").sum() +
-        (df["결과2"] == "O").sum() +
-        (df["결과3"] == "O").sum()
-    )
-    avg_correct = total_correct / len(df) if len(df) > 0 else 0
-    st.metric("평균 정답 수", f"{avg_correct:.1f} / 3")
-
-st.markdown("---")
-
-# ── 2. 문항별 정답률 ──
-st.header("📝 문항별 정답률")
-
-q_cols = st.columns(3)
-
-for i, col in enumerate(q_cols, start=1):
-    with col:
-        result_col = f"결과{i}"
-        total = len(df)
-        correct = (df[result_col] == "O").sum()
-        incorrect = (df[result_col] == "X").sum()
-        unknown = (df[result_col] == "?").sum()
-        
-        correct_rate = (correct / total * 100) if total > 0 else 0
-        
-        st.subheader(f"문항 {i}")
-        st.metric("정답률", f"{correct_rate:.1f}%")
-        
-        # 간단한 막대 차트
-        chart_data = pd.DataFrame({
-            "판정": ["O", "X", "?"],
-            "학생 수": [correct, incorrect, unknown]
-        })
-        st.bar_chart(chart_data.set_index("판정"))
-
-st.markdown("---")
-
-# ── 3. 학생별 제출 내역 (테이블) ──
-st.header("📋 학생별 제출 내역")
-
-# 학번 검색
-search_id = st.text_input("🔎 학번으로 검색", placeholder="예: 10130")
-
-# 검색 필터링
-display_df = df.copy()
-if search_id.strip():
-    display_df = display_df[display_df["student_id"].str.contains(search_id.strip())]
-
-# 표시할 컬럼 선택
-display_columns = ["student_id", "제출일시", "결과1", "결과2", "결과3"]
-st.dataframe(
-    display_df[display_columns],
-    use_container_width=True,
-    hide_index=True
-)
-
-st.markdown("---")
-
-# ── 4. 상세 조회 (학생별) ──
-st.header("🔍 상세 답안 조회")
-
-# 학생 선택
-student_ids = sorted(df["student_id"].unique())
-selected_student = st.selectbox("학생 선택", student_ids)
-
-if selected_student:
-    student_data = df[df["student_id"] == selected_student].sort_values("created_at", ascending=False)
-    
-    if len(student_data) > 1:
-        st.info(f"💡 {selected_student} 학생은 총 {len(student_data)}번 제출했습니다.")
-        submission_index = st.radio(
-            "제출 선택",
-            range(len(student_data)),
-            format_func=lambda x: f"{x+1}번째 제출 ({student_data.iloc[x]['제출일시']})",
-            horizontal=True
-        )
-    else:
-        submission_index = 0
-    
-    selected_row = student_data.iloc[submission_index]
-    
-    # 3개 문항 표시
-    for i in range(1, 4):
-        st.markdown(f"### 문항 {i}")
-        
-        col_a, col_b = st.columns([1, 1])
-        
-        with col_a:
-            st.markdown("**📝 학생 답안**")
-            answer = selected_row[f"answer_{i}"]
-            st.text_area(
-                f"답안 {i}",
-                value=answer,
-                height=100,
-                disabled=True,
-                label_visibility="collapsed"
+            # 프롬프트: 'O/X' 판정과 친절한 피드백 요청
+            prompt = (
+                f"문항 번호: {idx}\n"
+                f"채점 기준: {criterion}\n"
+                f"학생 답안: {ans}\n\n"
+                "출력 규칙:\n"
+                "- 반드시 한 줄로만 출력\n"
+                "- 형식은 정확히 'O: ...' 또는 'X: ...'\n"
+                "- 피드백은 학생에게 말하듯 친절하게, 200자 이내\n"
             )
-        
-        with col_b:
-            st.markdown("**🤖 AI 피드백**")
-            feedback = selected_row[f"feedback_{i}"]
-            
-            # O/X에 따라 색상 구분
-            if feedback.startswith("O:"):
-                st.success(feedback)
-            elif feedback.startswith("X:"):
-                st.error(feedback)
-            else:
-                st.info(feedback)
-        
-        # 채점 기준 표시
-        with st.expander(f"📌 문항 {i} 채점 기준"):
-            guideline = selected_row[f"guideline_{i}"]
-            st.write(guideline)
-        
-        st.markdown("---")
-    
-    # 메타 정보
-    with st.expander("ℹ️ 제출 정보"):
-        st.write(f"**모델**: {selected_row['model']}")
-        st.write(f"**제출 시각**: {selected_row['제출일시']}")
 
-st.markdown("---")
+            try:
+                response = client.chat.completions.create(
+                    model="gpt-5-mini",
+                    messages=[
+                        {"role": "system", "content": "너는 친절하지만 정확한 과학 교사다. 출력 규칙을 반드시 지켜라."},
+                        {"role": "user", "content": prompt},
+                    ],
+                    max_completion_tokens=1000,
+                )
+                raw_text = response.choices[0].message.content.strip()
+            except Exception as e:
+                raw_text = f"API 오류: {e}"
 
-# ── 5. 데이터 다운로드 ──
-st.header("💾 데이터 다운로드")
+            # 응답 정규화(포맷 보정)
+            feedbacks.append(normalize_feedback(raw_text))
 
-col1, col2 = st.columns(2)
+    # [결과 저장] 세션에 저장하여 리런 되어도 결과 유지
+    st.session_state.gpt_feedbacks = feedbacks
 
-with col1:
-    # CSV 다운로드
-    csv = df.to_csv(index=False).encode('utf-8-sig')  # 한글 깨짐 방지
-    st.download_button(
-        label="📥 전체 데이터 CSV 다운로드",
-        data=csv,
-        file_name=f"학생평가결과_{datetime.now().strftime('%Y%m%d_%H%M')}.csv",
-        mime="text/csv",
-        use_container_width=True
-    )
+    # [Supabase 연동 대비] 데이터 구조화 (Dictionary 형태)
+    st.session_state.gpt_payload = {
+        "student_id": student_id.strip(),
+        "answers": {f"Q{i}": a for i, a in enumerate(answers, start=1)},
+        "feedbacks": {f"Q{i}": fb for i, fb in enumerate(feedbacks, start=1)},
+        "guidelines": {f"Q{k}": v for k, v in GRADING_GUIDELINES.items()},
+        "model": "gpt-5-mini",
+        "created_at": datetime.now(timezone.utc).isoformat(),
+    }
+# ----Supabase 코드 추가----------------------------
+    # --- Supabase 저장: payload 생성 직후 실행 ---
+    try:
+        res = save_to_supabase(st.session_state.gpt_payload)
+        st.success("Supabase 저장 완료")
 
-with col2:
-    # 요약 통계 다운로드
-    summary_df = pd.DataFrame({
-        "학번": df["student_id"],
-        "제출일시": df["제출일시"],
-        "문항1": df["결과1"],
-        "문항2": df["결과2"],
-        "문항3": df["결과3"],
-        "정답개수": (df["결과1"] == "O").astype(int) + 
-                   (df["결과2"] == "O").astype(int) + 
-                   (df["결과3"] == "O").astype(int)
-    })
-    
-    summary_csv = summary_df.to_csv(index=False).encode('utf-8-sig')
-    st.download_button(
-        label="📥 요약 통계 CSV 다운로드",
-        data=summary_csv,
-        file_name=f"요약통계_{datetime.now().strftime('%Y%m%d_%H%M')}.csv",
-        mime="text/csv",
-        use_container_width=True
-    )
+        # 디버깅용: 저장된 데이터가 있으면 화면에 일부 표시
+        # (원하면 이후 삭제해도 됨)
+        st.write("insert result:", res.data)
 
-# ── Footer ──
-st.markdown("---")
-st.caption("📊 학생 서술형 평가 교사 대시보드 v1.0")
+    except KeyError as e:
+        st.error(f"secrets 누락: {e} (SUPABASE_URL / SUPABASE_SERVICE_ROLE_KEY 확인)")
+    except Exception as e:
+        st.error(f"Supabase 저장 오류: {e}")
+
+# ----Supabase 코드 추가----------------------------
+
+# ── 4. 결과 표시(저장된 값이 있으면 항상 표시) ──
+if st.session_state.gpt_feedbacks:
+    st.markdown("---")
+    st.subheader("📝 AI 피드백 결과")
+
+    for i, fb in enumerate(st.session_state.gpt_feedbacks, start=1):
+        # 시각적 구분을 위해 성공/정보 박스 분기
+        if fb.startswith("O:"):
+            st.success(f"**문항 {i}** : {fb}")
+        else:
+            st.info(f"**문항 {i}** : {fb}")
+
+    st.success("모든 피드백이 생성되었습니다. (DB 저장용 데이터 준비 완료)")
